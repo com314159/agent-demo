@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 
@@ -34,11 +35,31 @@ func main() {
 		schema.UserMessage("你好"),
 	}
 
-	// 普通（非流式）生成
-	resp, err := chatModel.Generate(ctx, msgs)
+	// 流式生成
+	stream, err := chatModel.Stream(ctx, msgs)
 	if err != nil {
-		log.Fatalf("调用模型失败: %v", err)
+		log.Fatalf("开启流式调用失败: %v", err)
 	}
-	fmt.Println("模型返回：", resp.Content)
+	defer stream.Close()
+
+	fmt.Println("模型流式返回：")
+	chunks := make([]*schema.Message, 0)
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("流式接收失败: %v", err)
+		}
+		chunks = append(chunks, chunk)
+		fmt.Print(chunk.Content)
+	}
+
+	full, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		log.Fatalf("拼接流式消息失败: %v", err)
+	}
+	fmt.Printf("\n模型完整返回：%s\n", full.Content)
 
 }
