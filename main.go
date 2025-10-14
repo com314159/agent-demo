@@ -1,114 +1,110 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/cloudwego/eino-ext/components/model/ark"
 	"github.com/cloudwego/eino/schema"
 )
 
-// 轻量内存实现
-type Memory struct {
-	mu       sync.Mutex
-	sessions map[string][]*schema.Message
-}
-
-func NewMemory() *Memory {
-	return &Memory{sessions: make(map[string][]*schema.Message)}
-}
-
-func (m *Memory) Get(session string) []*schema.Message {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessions[session]
-}
-
-func (m *Memory) Add(session string, msg *schema.Message) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sessions[session] = append(m.sessions[session], msg)
-}
-
-// 限制上下文条数，避免过长
-func (m *Memory) Trim(session string, max int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	msgs := m.sessions[session]
-	if len(msgs) > max {
-		m.sessions[session] = msgs[len(msgs)-max:]
+// 定义一个简单工具：获取天气
+func getWeather(city string) string {
+	city = strings.TrimSpace(city)
+	// 模拟调用外部API
+	switch city {
+	case "北京":
+		return "北京今天多云，气温 18~25℃。"
+	case "上海":
+		return "上海今天小雨，气温 20~27℃。"
+	default:
+		return fmt.Sprintf("%s 今天晴，气温 22~28℃。", city)
 	}
 }
 
 func main() {
 	ctx := context.Background()
-
 	apiKey := os.Getenv("ARK_API_KEY")
 	baseURL := os.Getenv("ARK_BASE_URL")
 	modelID := os.Getenv("ARK_MODEL")
+
 	if apiKey == "" || baseURL == "" || modelID == "" {
 		log.Fatal("请先设置 ARK_API_KEY / ARK_BASE_URL / ARK_MODEL 环境变量")
 	}
 
-	chatModel, err := ark.NewChatModel(ctx, &ark.ChatModelConfig{
+	chat, err := ark.NewChatModel(ctx, &ark.ChatModelConfig{
 		BaseURL: baseURL,
 		APIKey:  apiKey,
 		Model:   modelID,
 	})
 	if err != nil {
-		log.Fatalf("初始化 Ark ChatModel 失败: %v", err)
+		log.Fatalf("初始化模型失败: %v", err)
 	}
 
-	mem := NewMemory()
+	// 定义工具描述，告诉模型能调用什么函数
+	toolDef := &schema.ToolInfo{
+		Name: "getWeather",
+		Desc: "根据城市名称获取天气",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"city": {
+				Type:     schema.String,
+				Desc:     "城市名称",
+				Required: true,
+			},
+		}),
+	}
 
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("多轮对话 Demo 已启动。输入 `/a` 切换到会话A，`/b` 切换到会话B，`/exit` 退出。")
+	// 将工具绑定到模型实例
+	toolChat, err := chat.WithTools([]*schema.ToolInfo{toolDef})
+	if err != nil {
+		log.Fatalf("绑定工具失败: %v", err)
+	}
 
-	session := "A"
+	// 用户输入
+	user := schema.UserMessage("请告诉我今天北京的天气。")
 
-	for {
-		fmt.Printf("[%s] 你：", session)
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-		if text == "" {
-			continue
+	// 调用模型（非流式）
+	resp, err := toolChat.Generate(ctx, []*schema.Message{
+		schema.SystemMessage("你是一个智能助手，可以调用工具获取天气信息。"),
+		user,
+	})
+	if err != nil {
+		log.Fatalf("调用模型失败: %v", err)
+	}
+
+	// 打印模型的原始响应
+	fmt.Println("模型原始输出：", resp.Content)
+
+	// 检查是否包含 Tool 调用
+	if len(resp.ToolCalls) > 0 {
+		for _, call := range resp.ToolCalls {
+			fmt.Printf("🧩 模型请求调用工具：%s，参数：%s\n", call.Function.Name, call.Function.Arguments)
+
+			if call.Function.Name == "getWeather" {
+				var args struct {
+					City string `json:"city"`
+				}
+				_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+				weather := getWeather(args.City)
+				fmt.Println("🌤 工具返回结果：", weather)
+
+				// 把工具返回结果再喂回模型，让它生成最终自然语言
+				final, err := toolChat.Generate(ctx, []*schema.Message{
+					schema.SystemMessage("你是智能助手"),
+					user,
+					schema.ToolMessage(weather, call.ID, schema.WithToolName(call.Function.Name)),
+				})
+				if err != nil {
+					log.Fatalf("生成最终回答失败: %v", err)
+				}
+				fmt.Println("💬 最终回答：", final.Content)
+			}
 		}
-		if text == "/exit" {
-			break
-		}
-		if strings.HasPrefix(text, "/a") {
-			session = "A"
-			fmt.Println("👉 已切换到会话 A")
-			continue
-		}
-		if strings.HasPrefix(text, "/b") {
-			session = "B"
-			fmt.Println("👉 已切换到会话 B")
-			continue
-		}
-
-		// 将用户输入加入记忆
-		mem.Add(session, schema.UserMessage(text))
-		mem.Trim(session, 10) // 限制最近10轮
-
-		// 获取上下文
-		msgs := mem.Get(session)
-
-		// 调用模型
-		resp, err := chatModel.Generate(ctx, msgs)
-		if err != nil {
-			log.Println("调用模型失败:", err)
-			continue
-		}
-
-		fmt.Printf("[%s] AI：%s\n", session, resp.Content)
-
-		// 加入AI回复
-		mem.Add(session, schema.AssistantMessage(resp.Content, nil))
+	} else {
+		fmt.Println("模型没有请求调用任何工具。")
 	}
 }
