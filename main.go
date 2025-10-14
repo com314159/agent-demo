@@ -1,25 +1,48 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
-	"regexp"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/cloudwego/eino-ext/components/model/ark"
 	"github.com/cloudwego/eino/schema"
 )
 
-type Task struct {
-	Title       string    `json:"title"`
-	Priority    string    `json:"priority"` // low/normal/high
-	Due         time.Time `json:"due"`      // ISO8601
-	Description string    `json:"description,omitempty"`
+// 轻量内存实现
+type Memory struct {
+	mu       sync.Mutex
+	sessions map[string][]*schema.Message
+}
+
+func NewMemory() *Memory {
+	return &Memory{sessions: make(map[string][]*schema.Message)}
+}
+
+func (m *Memory) Get(session string) []*schema.Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessions[session]
+}
+
+func (m *Memory) Add(session string, msg *schema.Message) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[session] = append(m.sessions[session], msg)
+}
+
+// 限制上下文条数，避免过长
+func (m *Memory) Trim(session string, max int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msgs := m.sessions[session]
+	if len(msgs) > max {
+		m.sessions[session] = msgs[len(msgs)-max:]
+	}
 }
 
 func main() {
@@ -41,72 +64,51 @@ func main() {
 		log.Fatalf("初始化 Ark ChatModel 失败: %v", err)
 	}
 
-	// 要模型输出一个结构化 Task
-	system := schema.SystemMessage("你是一个只会输出 JSON 的助手。始终返回严格的 JSON，不要输出解释性文字。")
-	user := schema.UserMessage(`
-从这段话里抽取一个任务对象，并输出严格 JSON（不要多余文本/代码块）：
-"请帮我在下周一上午10点之前修复订单同步的Bug，优先级高，提醒写在描述里。"
-JSON 字段：
-- title (string)
-- priority (low|normal|high)
-- due (ISO8601，例如 2025-10-20T10:00:00+08:00)
-- description (string，可空)
-请只输出JSON！`)
+	mem := NewMemory()
 
-	// 非流式生成
-	resp, err := chatModel.Generate(ctx, []*schema.Message{system, user})
-	if err != nil {
-		log.Fatalf("调用模型失败: %v", err)
-	}
-	raw := strings.TrimSpace(resp.Content)
-	fmt.Println("原始输出：", raw)
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("多轮对话 Demo 已启动。输入 `/a` 切换到会话A，`/b` 切换到会话B，`/exit` 退出。")
 
-	task, err := parseTaskJSON(raw)
-	if err != nil {
-		// 简单自修复：尝试从 ```json ... ``` 代码块中提取
-		if fixed := tryExtractJSON(raw); fixed != "" {
-			fmt.Println("尝试自修复 JSON...")
-			task, err = parseTaskJSON(fixed)
+	session := "A"
+
+	for {
+		fmt.Printf("[%s] 你：", session)
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
 		}
-	}
-	if err != nil {
-		log.Fatalf("解析失败：%v", err)
-	}
+		if text == "/exit" {
+			break
+		}
+		if strings.HasPrefix(text, "/a") {
+			session = "A"
+			fmt.Println("👉 已切换到会话 A")
+			continue
+		}
+		if strings.HasPrefix(text, "/b") {
+			session = "B"
+			fmt.Println("👉 已切换到会话 B")
+			continue
+		}
 
-	fmt.Printf("解析成功：\n  Title=%s\n  Priority=%s\n  Due=%s\n  Desc=%s\n",
-		task.Title, task.Priority, task.Due.Format(time.RFC3339), task.Description)
-}
+		// 将用户输入加入记忆
+		mem.Add(session, schema.UserMessage(text))
+		mem.Trim(session, 10) // 限制最近10轮
 
-func parseTaskJSON(s string) (*Task, error) {
-	var t Task
-	if err := json.Unmarshal([]byte(s), &t); err != nil {
-		return nil, err
-	}
-	// 基本校验
-	if t.Title == "" || t.Priority == "" || t.Due.IsZero() {
-		return nil, errors.New("字段缺失或格式错误")
-	}
-	// 归一化优先级
-	switch strings.ToLower(t.Priority) {
-	case "low", "normal", "high":
-	default:
-		return nil, fmt.Errorf("priority 非法: %s", t.Priority)
-	}
-	return &t, nil
-}
+		// 获取上下文
+		msgs := mem.Get(session)
 
-var codeBlockJSON = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
+		// 调用模型
+		resp, err := chatModel.Generate(ctx, msgs)
+		if err != nil {
+			log.Println("调用模型失败:", err)
+			continue
+		}
 
-func tryExtractJSON(s string) string {
-	m := codeBlockJSON.FindStringSubmatch(s)
-	if len(m) == 2 {
-		return m[1]
+		fmt.Printf("[%s] AI：%s\n", session, resp.Content)
+
+		// 加入AI回复
+		mem.Add(session, schema.AssistantMessage(resp.Content, nil))
 	}
-	// 退一步：从首个 { 到最后一个 } 之间截取
-	start := strings.IndexByte(s, '{')
-	end := strings.LastIndexByte(s, '}')
-	if start >= 0 && end > start {
-		return s[start : end+1]
-	}
-	return ""
 }
