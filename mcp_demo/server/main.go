@@ -2,102 +2,88 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
-	"os"
-	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-type JSONRPCRequest struct {
+type rpcReq struct {
 	JSONRPC string          `json:"jsonrpc"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
-	ID      any             `json:"id,omitempty"`
+	ID      int             `json:"id,omitempty"`
+}
+type rpcResp struct {
+	JSONRPC string `json:"jsonrpc"`
+	Result  any    `json:"result,omitempty"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+	ID int `json:"id,omitempty"`
 }
 
-type JSONRPCResponse struct {
-	JSONRPC string        `json:"jsonrpc"`
-	Result  any           `json:"result,omitempty"`
-	Error   *JSONRPCError `json:"error,omitempty"`
-	ID      any           `json:"id,omitempty"`
-}
-
-type JSONRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
+var up = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func main() {
-	http.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		body, _ := io.ReadAll(r.Body)
-
-		var req JSONRPCRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeErr(w, nil, -32700, "parse error")
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("upgrade:", err)
 			return
 		}
-		switch req.Method {
-		case "getWeather":
-			var p struct {
-				City string `json:"city"`
-			}
-			if err := json.Unmarshal(req.Params, &p); err != nil {
-				writeErr(w, req.ID, -32602, "invalid params")
-				return
-			}
-			city := strings.TrimSpace(p.City)
-			var ans string
-			switch city {
-			case "北京":
-				ans = "北京今天多云，18~25℃。"
-			case "上海":
-				ans = "上海今天小雨，20~27℃。"
-			default:
-				ans = city + " 今天天气晴朗，22~28℃。"
-			}
-			writeOK(w, req.ID, map[string]any{
-				"content": ans,
-			})
+		defer c.Close()
+		log.Println("WS connected")
 
-		case "readFile":
-			var p struct {
-				Path string `json:"path"`
+		// 主动推送事件：onTick（模拟 MCP 通知）
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		go func() {
+			for t := range ticker.C {
+				evt := map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "onTick",
+					"params":  map[string]any{"now": t.Format(time.RFC3339)},
+				}
+				_ = c.WriteJSON(evt)
 			}
-			if err := json.Unmarshal(req.Params, &p); err != nil {
-				writeErr(w, req.ID, -32602, "invalid params")
-				return
-			}
-			data, err := os.ReadFile(p.Path)
+		}()
+
+		for {
+			_, data, err := c.ReadMessage()
 			if err != nil {
-				writeErr(w, req.ID, -32000, "read file error: "+err.Error())
+				log.Println("read:", err)
 				return
 			}
-			if len(data) > 2000 {
-				data = data[:2000] // 防止过大
-			}
-			writeOK(w, req.ID, map[string]any{
-				"content": string(data),
-			})
 
-		default:
-			writeErr(w, req.ID, -32601, "method not found")
+			var req rpcReq
+			if err := json.Unmarshal(data, &req); err != nil {
+				continue
+			}
+
+			switch req.Method {
+			case "getTime":
+				resp := rpcResp{JSONRPC: "2.0", ID: req.ID,
+					Result: map[string]any{"now": time.Now().Format(time.RFC3339)}}
+				_ = c.WriteJSON(resp)
+
+			default:
+				resp := rpcResp{JSONRPC: "2.0", ID: req.ID,
+					Error: (*struct {
+						Code    int    `json:"code"`
+						Message string `json:"message"`
+					})(&struct {
+						Code    int
+						Message string
+					}{-32601, "method not found"})}
+				_ = c.WriteJSON(resp)
+			}
 		}
 	})
 
-	log.Println("MCP-like JSON-RPC server on http://127.0.0.1:8089/rpc")
-	log.Fatal(http.ListenAndServe(":8089", nil))
-}
-
-func writeOK(w http.ResponseWriter, id any, result any) {
-	resp := JSONRPCResponse{JSONRPC: "2.0", Result: result, ID: id}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-func writeErr(w http.ResponseWriter, id any, code int, msg string) {
-	resp := JSONRPCResponse{JSONRPC: "2.0", Error: &JSONRPCError{Code: code, Message: msg}, ID: id}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	log.Println("WS JSON-RPC server at ws://127.0.0.1:8091/ws")
+	log.Fatal(http.ListenAndServe(":8091", nil))
 }
